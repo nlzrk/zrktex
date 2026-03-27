@@ -1,0 +1,32 @@
+# LaTeX auxiliary files
+*.aux
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
+*.idx
+*.ind
+*.ilg
+*.nav
+*.snm
+*.vrb
+*.bcf
+*.run.xml
+
+# Compiled output (keep .pdf optional — uncomment to ignore)
+# *.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+dist/
+build/
+*.spec
+editor.exe
