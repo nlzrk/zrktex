@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 zrktex — LaTeX editor
-  python zrktex.py [file.tex]        GUI  (default)
-  python zrktex.py --tui [file.tex]  TUI  (vim-like)
+  python zrktex.py [file.tex]               GUI  (default)
+  python zrktex.py --tui [file.tex]         TUI  (vim-like)
+  python zrktex.py --plots [file.tex]       GUI + interactive plot viewer
 """
 
-import subprocess, sys, os, re, shutil, threading
+import subprocess, sys, os, re, shutil, threading, hashlib, json as _json, webbrowser, urllib.parse
 from pathlib import Path
 from copy import deepcopy
 from enum import Enum
@@ -14,7 +15,8 @@ from typing import List, Tuple, Optional
 # ══════════════════════════════════════════════════════════════════════════════
 #  AUTO-INSTALL
 # ══════════════════════════════════════════════════════════════════════════════
-_TUI_MODE = "--tui" in sys.argv
+_TUI_MODE   = "--tui"   in sys.argv
+_PLOTS_MODE = "--plots" in sys.argv
 
 # Silently installs a package if it's missing — imp lets us handle cases
 # where the pip name differs from the import name (e.g. "Pillow" vs "PIL")
@@ -124,6 +126,43 @@ LATEX_COMMANDS = sorted([
     r"\plot",
 ])
 
+PLOT_OPTION_KEYS = sorted([
+    "alpha=", "button", "cmap=", "color=", "figheight=", "figwidth=",
+    "grid=", "label=", "linewidth=", "samples=", "style=",
+    "tmax=", "tmin=", "title=", "type=",
+    "width=", "xlabel=", "xmax=", "xmin=",
+    "ylabel=", "ymax=", "ymin=",
+    "zlabel=", "zmax=", "zmin=",
+])
+PLOT_OPTION_VALUES: dict = {
+    "type":  ["2d", "3d", "complex", "curve3d", "param", "parametric", "surface", "vector"],
+    "style": ["quiver", "stream"],
+    "cmap":  ["RdBu", "coolwarm", "hsv", "inferno", "magma", "plasma", "twilight", "viridis"],
+    "grid":  ["false", "true"],
+}
+
+
+def _plot_option_context(line: str):
+    """Return (prefix, candidates) when cursor is inside \\plot[...], else None."""
+    if not re.search(r"\\plot\[", line):
+        return None
+    m = re.search(r"\\plot\[([^\]]*?)$", line)
+    if not m:
+        return None
+    opts = m.group(1)
+    # Value completion — after  key=partial
+    vm = re.search(r"(\w+)=(\w*)$", opts)
+    if vm:
+        key, partial = vm.group(1), vm.group(2)
+        vals = PLOT_OPTION_VALUES.get(key, [])
+        return (partial, [v for v in vals if v.startswith(partial)])
+    # Key completion — after comma / opening bracket
+    km = re.search(r"(?:^|,\s*)(\w*)$", opts)
+    if km:
+        partial = km.group(1)
+        return (partial, [k for k in PLOT_OPTION_KEYS if k.startswith(partial)])
+    return ("", [])
+
 ENVIRONMENTS = sorted([
     "document", "abstract",
     "equation", "equation*", "align", "align*", "aligned",
@@ -199,13 +238,23 @@ class PlotProcessor:
         spans = self._find_all(content)
         if not spans:
             return content
-        out, prev = [], 0
+        out, prev, has_button = [], 0, False
         for start, end, opts_raw, expr_raw in spans:
             out.append(content[prev:start])
-            out.append(self._render_one(opts_raw, expr_raw))
+            rendered = self._render_one(opts_raw, expr_raw)
+            out.append(rendered)
+            if "zrkplot://" in rendered:
+                has_button = True
             prev = end
         out.append(content[prev:])
-        return "".join(out)
+        result = "".join(out)
+        if has_button and "hyperref" not in result:
+            result = re.sub(
+                r"(\\documentclass(?:\[.*?\])?\{.*?\})",
+                r"\1\n\\usepackage[hidelinks]{hyperref}",
+                result, count=1, flags=re.DOTALL,
+            )
+        return result
 
     # Scans for every \plot occurrence and returns (start, end, opts_raw, expr_raw) tuples.
     # Uses a brace-depth counter rather than a regex so nested braces/brackets don't trip it up.
@@ -278,31 +327,54 @@ class PlotProcessor:
         opts  = self._parse_opts(opts_raw)
         ptype = opts.get("type", "2d").lower().replace("-","").replace("_","")
         fw, fh = self._fval(opts,"figwidth",5.5), self._fval(opts,"figheight",4.0)
-        out_path = str(self.plots_dir / f"zrkplot_{self.counter:03d}.pdf")
+        out_path  = str(self.plots_dir / f"zrkplot_{self.counter:03d}.pdf")
+        hash_path = str(self.plots_dir / f"zrkplot_{self.counter:03d}.hash")
+        json_path = str(self.plots_dir / f"zrkplot_{self.counter:03d}.json")
+
+        # Content-hash caching — skip re-rendering if nothing changed
+        content_hash = hashlib.md5(f"{opts_raw}|{expr_raw}".encode()).hexdigest()
+        cached = (os.path.exists(out_path) and os.path.exists(hash_path) and
+                  Path(hash_path).read_text().strip() == content_hash)
+
         err = None
-        try:
-            self._set_style()
-            dispatch = {
-                "2d": self._plot_2d, "real": self._plot_2d,
-                "parametric": self._plot_param, "param": self._plot_param,
-                "curve3d": self._plot_curve3d, "parametric3d": self._plot_curve3d,
-                "3d": self._plot_3d, "surface": self._plot_3d,
-                "complex": self._plot_complex,
-                "vector": self._plot_vector, "field": self._plot_vector,
-            }
-            dispatch.get(ptype, self._plot_2d)(opts, expr_raw, fw, fh)
-            plt.tight_layout()
-            plt.savefig(out_path, format="pdf", bbox_inches="tight", dpi=150)
-        except Exception as ex:
-            err = str(ex)
-        finally:
-            plt.close("all")
+        if not cached:
+            try:
+                self._set_style()
+                dispatch = {
+                    "2d": self._plot_2d, "real": self._plot_2d,
+                    "parametric": self._plot_param, "param": self._plot_param,
+                    "curve3d": self._plot_curve3d, "parametric3d": self._plot_curve3d,
+                    "3d": self._plot_3d, "surface": self._plot_3d,
+                    "complex": self._plot_complex,
+                    "vector": self._plot_vector, "field": self._plot_vector,
+                }
+                dispatch.get(ptype, self._plot_2d)(opts, expr_raw, fw, fh)
+                plt.tight_layout()
+                plt.savefig(out_path, format="pdf", bbox_inches="tight", dpi=150)
+                Path(hash_path).write_text(content_hash)
+            except Exception as ex:
+                err = str(ex)
+            finally:
+                plt.close("all")
+
         if err:
             safe = err.replace("\\",r"\textbackslash{}").replace("{",r"\{").replace("}",r"\}")
             return r"\fbox{\texttt{\small Plot error: " + safe + "}}"
         rel = os.path.relpath(out_path, self.tex_path.parent).replace("\\","/")
         width = opts.get("width", r"0.8\linewidth")
-        return f"\\includegraphics[width={width}]{{{rel}}}"
+        is_btn = bool(re.search(r'\bbutton\b', opts_raw))
+        if _PLOTS_MODE or is_btn:
+            try:
+                with open(json_path, "w") as _f:
+                    _json.dump({"type": ptype, "opts_raw": opts_raw,
+                                "expr_raw": expr_raw, "fw": fw, "fh": fh,
+                                "button": is_btn}, _f)
+            except Exception:
+                pass
+        inc = f"\\includegraphics[width={width}]{{{rel}}}"
+        if is_btn:
+            return f"\\href{{zrkplot://{self.counter}}}{{{inc}}}"
+        return inc
 
     # The seaborn style name changed in matplotlib 3.6 — try both spellings before giving up
     @staticmethod
@@ -519,6 +591,30 @@ def _cleanup_processed(proc_tex: str, original_path: str):
             pass
 
 
+def _parse_log_errors(log_text: str):
+    """Extract (line_number, message) pairs from a pdflatex log.
+
+    pdflatex error format:
+      ! LaTeX Error: ...      <- the error message
+      ...
+      l.42 <context>          <- the line number
+    """
+    errors = []
+    lines = log_text.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("!"):
+            msg = lines[i][1:].strip()
+            # Search the next 20 lines for "l.NNN"
+            for j in range(i + 1, min(i + 20, len(lines))):
+                m = re.match(r"^l\.(\d+)", lines[j])
+                if m:
+                    errors.append((int(m.group(1)), msg))
+                    break
+        i += 1
+    return errors
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  TUI — vim-like curses editor
 # ══════════════════════════════════════════════════════════════════════════════
@@ -543,15 +639,26 @@ C_PUNCT=6; C_STATUS=7; C_LINENO=8; C_COMPLETE=9; C_COMP_SEL=10
 C_SEARCH=11; C_VISUAL=12
 
 def _init_colors():
-    curses.start_color(); curses.use_default_colors()
-    curses.init_pair(C_DEFAULT,  curses.COLOR_WHITE,   -1)
-    curses.init_pair(C_KEYWORD,  curses.COLOR_CYAN,    -1)
-    curses.init_pair(C_COMMENT,  curses.COLOR_GREEN,   -1)
-    curses.init_pair(C_STRING,   curses.COLOR_YELLOW,  -1)
-    curses.init_pair(C_NUMBER,   curses.COLOR_MAGENTA, -1)
-    curses.init_pair(C_PUNCT,    curses.COLOR_RED,     -1)
+    curses.start_color()
+    # use_default_colors() lets us use -1 (transparent) for backgrounds, but it's
+    # unreliable on Windows — silent failures there cause text to render as black.
+    # On Windows we just force COLOR_BLACK so colours are always predictable.
+    if sys.platform == "win32":
+        BG = curses.COLOR_BLACK
+    else:
+        try:
+            curses.use_default_colors()
+            BG = -1
+        except Exception:
+            BG = curses.COLOR_BLACK
+    curses.init_pair(C_DEFAULT,  curses.COLOR_WHITE,   BG)
+    curses.init_pair(C_KEYWORD,  curses.COLOR_CYAN,    BG)
+    curses.init_pair(C_COMMENT,  curses.COLOR_GREEN,   BG)
+    curses.init_pair(C_STRING,   curses.COLOR_YELLOW,  BG)
+    curses.init_pair(C_NUMBER,   curses.COLOR_MAGENTA, BG)
+    curses.init_pair(C_PUNCT,    curses.COLOR_RED,     BG)
     curses.init_pair(C_STATUS,   curses.COLOR_BLACK,   curses.COLOR_WHITE)
-    curses.init_pair(C_LINENO,   curses.COLOR_YELLOW,  -1)
+    curses.init_pair(C_LINENO,   curses.COLOR_YELLOW,  BG)
     curses.init_pair(C_COMPLETE, curses.COLOR_BLACK,   curses.COLOR_CYAN)
     curses.init_pair(C_COMP_SEL, curses.COLOR_BLACK,   curses.COLOR_WHITE)
     curses.init_pair(C_SEARCH,   curses.COLOR_BLACK,   curses.COLOR_YELLOW)
@@ -688,8 +795,15 @@ class Editor:
             if r.returncode == 0:
                 self.msg = "Compiled OK!"; return True
             out = r.stdout or r.stderr or ""
-            errs = [ln for ln in out.splitlines() if ln.startswith("!")]
-            self.msg = ("Error: " + errs[0][:80]) if errs else "Compile failed (check .log)."
+            parsed = _parse_log_errors(out)
+            if parsed:
+                line_no, msg = parsed[0]
+                self.msg = f"Error at l.{line_no}: {msg[:70]}"
+                # Jump cursor to error line (clamp to file length)
+                self.row = max(0, min(line_no - 1, len(self.lines) - 1)); self.col = 0
+            else:
+                raw = [ln for ln in out.splitlines() if ln.startswith("!")]
+                self.msg = ("Error: " + raw[0][:80]) if raw else "Compile failed (check .log)."
             return False
         except subprocess.TimeoutExpired:
             self.msg = "Compile timed out."; return False
@@ -774,6 +888,16 @@ class Editor:
         return ""
 
     def _ac_update(self):
+        line = self.lines[self.row][:self.col]
+        # \plot option/value completion takes priority
+        ctx = _plot_option_context(line)
+        if ctx is not None:
+            prefix, candidates = ctx
+            self.ac_prefix = prefix
+            self.ac_list   = candidates[:12]
+            self.ac_idx    = 0 if self.ac_list else -1
+            return
+        # Regular \command completion
         prefix = self._ac_prefix()
         if not prefix or prefix == "\\":
             self.ac_list=[]; self.ac_idx=-1; self.ac_prefix=""; return
@@ -1176,10 +1300,23 @@ class AutoComplete:
         self._items=[]; self._prefix=""
 
     def update(self):
-        prefix=self._get_prefix()
-        if not prefix: self.hide(); return
-        matches=[c for c in LATEX_COMMANDS if c.startswith(prefix)]
-        if matches: self._show(matches,prefix)
+        line = self._ed.get("insert linestart", "insert")
+        # \plot option/value completion takes priority
+        ctx = _plot_option_context(line)
+        if ctx is not None:
+            prefix, candidates = ctx
+            if candidates:
+                self._show(candidates, prefix)
+            else:
+                self.hide()
+            return
+        # Regular \command completion
+        m = re.search(r"\\[a-zA-Z]*$", line)
+        if not m:
+            self.hide(); return
+        prefix = m.group(0)
+        matches = [c for c in LATEX_COMMANDS if c.startswith(prefix)]
+        if matches: self._show(matches, prefix)
         else: self.hide()
 
     def visible(self): return self._win is not None
@@ -1202,11 +1339,6 @@ class AutoComplete:
     def hide(self):
         if self._win: self._win.destroy(); self._win=None; self._lb=None
         self._items=[]; self._prefix=""
-
-    def _get_prefix(self):
-        line=self._ed.get("insert linestart","insert")
-        m=re.search(r"\\[a-zA-Z]*$",line)
-        return m.group(0) if m else ""
 
     def _show(self,items,prefix):
         self._items=items[:self.MAX]; self._prefix=prefix
@@ -1231,12 +1363,21 @@ class AutoComplete:
         self._win.geometry(f"230x{len(self._items)*19+4}+{x}+{y}")
 
 
+
 class PDFViewer(tk.Frame):
-    def __init__(self,master,**kw):
+    def __init__(self,master,on_plot_open=None,**kw):
         kw.setdefault("bg",T["tbar"]); super().__init__(master,**kw)
         self._zoom=1.0; self._path=None; self._imgs=[]
+        self._on_plot_open = on_plot_open
+        self._plot_rects: list = []  # (x1,y1,x2,y2,json_path) in canvas pixels, from link annotations
+
         hdr=tk.Frame(self,bg=T["tbar"],height=28); hdr.pack(fill=tk.X,side=tk.TOP); hdr.pack_propagate(False)
         tk.Label(hdr,text="PDF Preview",bg=T["tbar"],fg=T["ln_fg"],font=FONT_UI).pack(side=tk.LEFT,padx=8)
+        # Plots button — hidden until --plots mode is active and plots are ready
+        self._plots_btn=tk.Button(hdr,text="Plots ▾",command=self._show_plots_menu,
+                                  bg=T["tbar"],fg=T["cmd"],relief=tk.FLAT,
+                                  font=FONT_UI,padx=6,pady=0)
+        # packed lazily by set_plots_dir when plots are available
         tk.Button(hdr,text="+",command=self._zoom_in,bg=T["tbar"],fg=T["fg"],relief=tk.FLAT,
                   font=("Consolas",11),padx=4,pady=0).pack(side=tk.RIGHT,padx=2,pady=3)
         self._zlbl=tk.Label(hdr,text="100%",bg=T["tbar"],fg=T["fg"],font=FONT_UI,width=5)
@@ -1251,7 +1392,84 @@ class PDFViewer(tk.Frame):
         hsb.pack(side=tk.BOTTOM,fill=tk.X); vsb.pack(side=tk.RIGHT,fill=tk.Y)
         self._canvas.pack(side=tk.LEFT,fill=tk.BOTH,expand=True)
         self._canvas.bind("<MouseWheel>",lambda e:self._canvas.yview_scroll(-1*(e.delta//120),"units"))
+        self._canvas.bind("<Button-1>", self._on_canvas_click)
+        self._canvas.bind("<Button-3>", self._on_canvas_click)
+        self._canvas.bind("<Motion>",   self._on_canvas_motion)
         self._placeholder()
+
+    def set_plots_dir(self, plots_dir: Optional[str], on_plot_open=None):
+        """Called by App after a compile for the --plots Plots ▾ button."""
+        if on_plot_open:
+            self._on_plot_open = on_plot_open
+        has_plots = (_PLOTS_MODE and bool(plots_dir and os.path.isdir(plots_dir) and
+                         any(f.endswith(".json") for f in os.listdir(plots_dir))))
+        if has_plots:
+            self._plots_btn.pack(side=tk.LEFT, padx=4, pady=3)
+        else:
+            self._plots_btn.pack_forget()
+
+    def _plots_dir(self):
+        """Derive the _zrkplots directory from the currently loaded PDF path."""
+        if not self._path:
+            return None
+        d = str(Path(self._path).parent / "_zrkplots")
+        return d if os.path.isdir(d) else None
+
+    def _json_files(self):
+        d = self._plots_dir()
+        if not d:
+            return []
+        return sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".json"))
+
+    def _show_plots_menu(self, event=None):
+        jsons = self._json_files()
+        if not jsons:
+            menu = tk.Menu(self, tearoff=False, bg=T["tbar"], fg=T["ln_fg"], bd=0)
+            menu.add_command(label="No plots yet — compile a document with \\plot",
+                             state=tk.DISABLED)
+            try:
+                x = self._plots_btn.winfo_rootx()
+                y = self._plots_btn.winfo_rooty() + self._plots_btn.winfo_height()
+                menu.tk_popup(x, y)
+            finally:
+                menu.grab_release()
+            return
+        menu = tk.Menu(self, tearoff=False, bg=T["tbar"], fg=T["fg"],
+                       activebackground=T["sel"], activeforeground=T["fg"], bd=0)
+        for jpath in jsons:
+            try:
+                d = _json.loads(Path(jpath).read_text())
+                label = f"{d['type']:10s}  {d['expr_raw'][:45]}"
+            except Exception:
+                label = os.path.basename(jpath)
+            menu.add_command(label=label,
+                             command=lambda p=jpath: self._open_plot(p))
+        try:
+            x = self._plots_btn.winfo_rootx()
+            y = self._plots_btn.winfo_rooty() + self._plots_btn.winfo_height()
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _hit(self, event):
+        """Return the json_path of the button-plot rect under the cursor, or None."""
+        cx=self._canvas.canvasx(event.x); cy=self._canvas.canvasy(event.y)
+        for x1,y1,x2,y2,jp in self._plot_rects:
+            if x1<=cx<=x2 and y1<=cy<=y2:
+                return jp
+        return None
+
+    def _on_canvas_motion(self, event):
+        self._canvas.config(cursor="hand2" if self._hit(event) else "")
+
+    def _on_canvas_click(self, event):
+        jp = self._hit(event)
+        if jp:
+            self._open_plot(jp)
+
+    def _open_plot(self, json_path: str):
+        if self._on_plot_open:
+            self._on_plot_open(json_path)
 
     def _placeholder(self):
         self._canvas.delete("all")
@@ -1266,15 +1484,25 @@ class PDFViewer(tk.Frame):
         if not self._path or not os.path.exists(self._path): return
         try: doc=fitz.open(self._path)
         except Exception: return
-        self._canvas.delete("all"); self._imgs.clear()
-        mat=fitz.Matrix(self._zoom*1.5,self._zoom*1.5)
-        y=12; max_w=0
+        self._canvas.delete("all"); self._imgs.clear(); self._plot_rects.clear()
+        scale=self._zoom*1.5
+        mat=fitz.Matrix(scale,scale)
+        d=self._plots_dir(); y=12; max_w=0
         for page in doc:
             pix=page.get_pixmap(matrix=mat,alpha=False)
             img=Image.frombytes("RGB",(pix.width,pix.height),pix.samples)
             photo=ImageTk.PhotoImage(img); self._imgs.append(photo)
             self._canvas.create_rectangle(14,y+3,14+pix.width+1,y+pix.height+1,fill="#111",outline="")
             self._canvas.create_image(12,y,anchor="nw",image=photo)
+            if d:
+                for lnk in page.get_links():
+                    uri=lnk.get("uri","")
+                    if uri.startswith("zrkplot://"):
+                        r=lnk["from"]; idx=int(uri.split("://")[1])
+                        jp=os.path.join(d,f"zrkplot_{idx:03d}.json")
+                        if os.path.exists(jp):
+                            self._plot_rects.append((12+r.x0*scale,y+r.y0*scale,
+                                                     12+r.x1*scale,y+r.y1*scale,jp))
             y+=pix.height+18; max_w=max(max_w,pix.width)
         doc.close(); self._canvas.configure(scrollregion=(0,0,max_w+24,y))
 
@@ -1296,12 +1524,14 @@ class App:
         ed_frame=tk.Frame(self._paned,bg=T["bg"])
         self._paned.add(ed_frame,weight=3)
         self._build_editor(ed_frame)
-        self.pdf=PDFViewer(self._paned); self._paned.add(self.pdf,weight=2)
+        self.pdf=PDFViewer(self._paned,on_plot_open=self._open_plot_viewer); self._paned.add(self.pdf,weight=2)
         self._build_statusbar(); self._build_output()
         self._ac=AutoComplete(self.editor,self.root)
         self._bind()
-        if len(sys.argv)>2 or (len(sys.argv)==2 and sys.argv[1]!="--tui"):
-            path=sys.argv[-1] if sys.argv[-1]!="--tui" else None
+        _flags = {"--tui", "--plots"}
+        _file_args = [a for a in sys.argv[1:] if a not in _flags]
+        if _file_args:
+            path = _file_args[-1]
             if path: self._open_file(path)
             else: self._new_template()
         else:
@@ -1378,6 +1608,7 @@ class App:
             self.editor.tag_configure(tag,foreground=fg)
         self.editor.tag_configure("match",background="#2d4f1e",foreground=T["fg"])
         self.editor.tag_configure("match_cur",background=T["sel"],foreground="#ffffff")
+        self.editor.tag_configure("err_line",background=T["err_bg"],underline=True)
         self.editor.tag_raise("cmt")
 
     # The scrollbar's yscrollcommand fires this instead of editor.yview directly so that
@@ -1403,7 +1634,10 @@ class App:
                                 height=7,state=tk.DISABLED,bd=0,highlightthickness=0,padx=8,pady=4)
         self._out_text.tag_configure("ok",foreground=T["ok"])
         self._out_text.tag_configure("err",foreground=T["err"])
+        self._out_text.tag_configure("errlink",foreground=T["err"],underline=True)
         self._out_text.pack(fill=tk.X); self._out_visible=True
+        # Double-click on a line containing "l.NN" jumps to that line in the editor
+        self._out_text.bind("<Double-Button-1>", self._on_output_click)
 
     def _toggle_output(self,*_):
         if self._out_visible: self._out_frame.pack_forget()
@@ -1529,6 +1763,7 @@ class App:
             if not path: return
             self.filepath=path; self._do_save(path)
         self._save()
+        self._clear_error_highlights()   # remove stale highlights from previous compile
         self._set_out("Compiling…\n")
         self._compile_lbl.config(text="Compiling…",fg="#ffd700")
         threading.Thread(target=self._run_compile,args=(self.filepath,open_pdf),daemon=True).start()
@@ -1559,15 +1794,28 @@ class App:
         # pdflatex sometimes exits non-zero even when it produced a usable PDF, so also
         # treat a present PDF as success (latexmk behaves similarly on recoverable errors)
         ok=res.returncode==0 or os.path.exists(pdf_path)
+
+        # Parse errors from log and highlight them in the editor
+        errors = _parse_log_errors(out)
+        if errors:
+            self.root.after(0, lambda e=errors: self._apply_error_highlights(e))
+        else:
+            self.root.after(0, self._clear_error_highlights)
+
         if ok:
             self._append_out("\n✓ Compiled successfully.\n","ok")
             self.root.after(0,lambda:self._compile_lbl.config(text="✓ Compiled",fg=T["ok"]))
             self.root.after(0,lambda:self.pdf.load(pdf_path))
             if open_pdf: self.root.after(0,lambda:_open_pdf_file(pdf_path))
+            # Update Plots ▾ button visibility (--plots mode)
+            plots_dir = str(Path(path).parent / "_zrkplots")
+            self.root.after(0, lambda d=plots_dir: self.pdf.set_plots_dir(d))
         else:
             errs=[l for l in out.splitlines() if l.startswith("!")]
             msg=errs[0] if errs else "Compilation failed."
             self._append_out(f"\n✗ {msg}\n","err")
+            # Tag "l.NN" occurrences in the output panel as clickable error links
+            self._tag_output_error_links()
             self.root.after(0,lambda:self._compile_lbl.config(text="✗ Error",fg=T["err"]))
 
     # Debounce highlighting — cancel any pending rehighlight and restart the timer.
@@ -1656,6 +1904,82 @@ class App:
             self._out_text.config(state=tk.DISABLED); self._out_text.see(tk.END)
         self.root.after(0,_do)
 
+    # ── Error highlighting ─────────────────────────────────────────────────────
+
+    def _apply_error_highlights(self, errors):
+        """Paint a red background on every line that pdflatex reported an error on."""
+        self.editor.tag_remove("err_line", "1.0", tk.END)
+        for line_no, _msg in errors:
+            self.editor.tag_add("err_line", f"{line_no}.0", f"{line_no}.end")
+        # Scroll to the first error
+        if errors:
+            self.editor.see(f"{errors[0][0]}.0")
+
+    def _clear_error_highlights(self):
+        self.editor.tag_remove("err_line", "1.0", tk.END)
+
+    def _tag_output_error_links(self):
+        """Underline 'l.NN' tokens in the compile output so they look clickable."""
+        def _do():
+            self._out_text.config(state=tk.NORMAL)
+            text = self._out_text.get("1.0", tk.END)
+            for m in re.finditer(r"l\.(\d+)", text):
+                s = f"1.0+{m.start()}c"
+                e = f"1.0+{m.end()}c"
+                self._out_text.tag_add("errlink", s, e)
+            self._out_text.config(state=tk.DISABLED)
+        self.root.after(0, _do)
+
+    def _on_output_click(self, event):
+        """Double-click on 'l.NN' in the output panel → jump to that line in editor."""
+        idx = self._out_text.index(f"@{event.x},{event.y}")
+        line_text = self._out_text.get(f"{idx} linestart", f"{idx} lineend")
+        m = re.search(r"l\.(\d+)", line_text)
+        if m:
+            line_no = int(m.group(1))
+            self.editor.mark_set(tk.INSERT, f"{line_no}.0")
+            self.editor.see(f"{line_no}.0")
+            self.editor.focus_set()
+
+    # ── Interactive plot viewer ────────────────────────────────────────────────
+
+    def _open_plot_viewer(self, json_path: str):
+        try:
+            data = _json.loads(Path(json_path).read_text())
+        except Exception as ex:
+            messagebox.showerror("Plot error", f"Could not read plot data:\n{ex}", parent=self.root)
+            return
+        expr  = data.get("expr_raw", "")
+        ptype = data.get("type", "2d")
+        opts  = {k.strip(): v.strip()
+                 for part in data.get("opts_raw", "").split(",")
+                 if "=" in part
+                 for k, v in [part.split("=", 1)]}
+
+        # Build a WolframAlpha query from the plot type and expression
+        if ptype in ("parametric", "param"):
+            query = f"parametric plot {expr}"
+        elif ptype in ("3d", "surface"):
+            query = f"plot {expr}"
+        elif ptype in ("curve3d", "parametric3d"):
+            query = f"3d parametric plot {expr}"
+        elif ptype == "vector":
+            query = f"vector field {expr}"
+        elif ptype == "complex":
+            query = f"plot {expr}"
+        else:  # 2d
+            xmin = opts.get("xmin", "-10")
+            xmax = opts.get("xmax",  "10")
+            query = f"plot {expr} from {xmin} to {xmax}"
+
+        url = "https://www.wolframalpha.com/input?" + urllib.parse.urlencode({"i": query})
+        try:
+            webbrowser.open(url)
+        except Exception as ex:
+            messagebox.showerror("Plot error", f"Could not open browser:\n{ex}", parent=self.root)
+
+    # ── Status / position ─────────────────────────────────────────────────────
+
     def _update_title(self):
         name=Path(self.filepath).name if self.filepath else "untitled.tex"
         self.root.title(f"zrktex — {name}{' ●' if self.dirty else ''}")
@@ -1672,7 +1996,7 @@ class App:
 #  ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    args = [a for a in sys.argv[1:] if a != "--tui"]
+    args = [a for a in sys.argv[1:] if a not in ("--tui", "--plots")]
     filename = args[0] if args else None
 
     if _TUI_MODE:

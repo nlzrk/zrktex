@@ -1,6 +1,6 @@
 # zrktex
 
-A LaTeX editor that runs in two modes from the same file: a **GUI** with a live PDF preview panel, and a **TUI** that works like Vim. Write your documents, embed `\plot` commands for inline graphs, and compile straight to PDF — no config required.
+A LaTeX editor that runs in two modes from the same file: a **GUI** with a live PDF preview, and a **TUI** that works like Vim. Write your documents, embed `\plot` commands for inline graphs, and compile straight to PDF — no config files, no setup beyond a LaTeX installation.
 
 ---
 
@@ -17,14 +17,16 @@ A LaTeX editor that runs in two modes from the same file: a **GUI** with a live 
 
 ## Features
 
-- **`\plot` command** — embed any graph directly in your document: real functions, parametric curves, 3-D surfaces, complex domain colouring, vector fields. Plots are generated with matplotlib at compile time and included as PDF figures.
-- **GUI editor** — syntax-highlighted editor with line numbers, autocomplete popup, auto-pairs, auto-indent, split PDF preview, find dialog, and compile output panel
-- **TUI editor** — full vim keybindings (Normal / Insert / Command / Visual modes), live search, 300-level undo, autocomplete popup
-- **LaTeX autocomplete** — type `\` and get a filtered list of 200+ commands; navigate with Tab / arrows
+- **`\plot` command** — embed graphs directly in your document: real functions, parametric curves, 3-D surfaces, complex domain colouring, vector fields. Generated with matplotlib at compile time.
+- **`\plot[button]`** — clicking the PDF preview opens the plot on WolframAlpha in your browser
+- **GUI editor** — syntax-highlighted editor with line numbers, autocomplete, auto-pairs, auto-indent, split PDF preview, find dialog, and compile output panel
+- **TUI editor** — full vim keybindings (Normal / Insert / Command / Visual modes), live search, 300-level undo, autocomplete
+- **LaTeX autocomplete** — type `\` for a filtered list of 200+ commands, or type inside `\plot[...]` for option/value completion
 - **Auto-pairs** — `{`, `[`, `(`, `$` close themselves and position the cursor inside
 - **Smart indent** — Enter preserves indentation and adds a level after `\begin{...}` or `{`
 - **Compiler detection** — tries `pdflatex` → `latexmk` → `tectonic`, uses whatever is installed
-- **Boilerplate template** — new files open with a ready-to-use preamble
+- **Plot caching** — unchanged plots are skipped on recompile, so only what changed gets re-rendered
+- **Error navigation** — compile errors highlight the offending line and jump the cursor there
 
 ---
 
@@ -82,19 +84,17 @@ cd zrktex
 bash install.sh
 ```
 
-This installs `zrktex.py` to `~/.local/share/zrktex/`, drops a launcher at `~/.local/bin/zrktex`, and installs all Python dependencies. It also offers to add `~/.local/bin` to your PATH automatically.
+The script asks whether you want GUI, TUI, or both, installs the right dependencies, copies the files to `~/.local/share/zrktex/`, and drops a launcher at `~/.local/bin/zrktex`. It also offers to add `~/.local/bin` to your PATH.
 
-### Linux — system-wide install
+### Linux — system-wide
 
 ```bash
 sudo bash install.sh
 ```
 
-Installs to `/usr/local/`. After this, `zrktex` works for all users.
+Installs to `/usr/local/`. Works for all users after that.
 
-### Manual Linux launcher
-
-If you just want to drop two files into `/usr/local/bin/`:
+### Manual
 
 ```bash
 sudo cp zrktex.py zrktex /usr/local/bin/
@@ -108,7 +108,7 @@ sudo chmod +x /usr/local/bin/zrktex
 ```bash
 zrktex file.tex           # GUI
 zrktex --tui file.tex     # TUI
-zrktex --tui              # TUI with no file (use :w <name> to save)
+zrktex --tui              # TUI, no file (use :w <name> to save)
 
 # Without install.sh:
 python zrktex.py file.tex
@@ -119,10 +119,10 @@ python zrktex.py --tui file.tex
 
 ## `\plot` command
 
-Write `\plot` anywhere in your document. When you compile, each command is replaced with a properly-sized `\includegraphics` pointing to a matplotlib-generated PDF figure in `_zrkplots/`.
+Write `\plot` anywhere in your document body. When you compile, each one is replaced with an `\includegraphics` pointing to a matplotlib-generated PDF in `_zrkplots/`. Plots are cached by content hash, so recompiling a document where only one plot changed only re-renders that one.
 
 ```latex
-% 2-D functions (comma-separate for multiple curves)
+% 2-D function (comma-separate for multiple curves)
 \plot[xmin=-5, xmax=5, legend=sin;cos]{sin(x), cos(x)}
 
 % Parametric curve
@@ -141,11 +141,23 @@ Write `\plot` anywhere in your document. When you compile, each command is repla
 \plot[type=curve3d, tmin=0, tmax=12.566]{cos(t), sin(t), t/4}
 ```
 
+### Clickable plots
+
+Add `button` to any `\plot` to make it clickable in the PDF preview. After compiling, hover over the preview — the cursor changes to a hand when button plots are present. Click to open the plot on WolframAlpha in your browser.
+
+```latex
+\plot[button]{x**2}
+\plot[button, type=3d, xmin=-3, xmax=3, ymin=-3, ymax=3]{sin(x)*cos(y)}
+```
+
+> **Note:** if you had a version of this file compiled before adding `button`, delete the old PDF and recompile — the previous version had a link annotation that conflicts with this feature.
+
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `type` | `2d` | `2d` · `parametric` · `3d` · `complex` · `vector` · `curve3d` |
+| `button` | — | makes the plot clickable in the PDF preview |
 | `xmin` / `xmax` | `-5` / `5` | x-axis bounds (supports `pi`, `e`) |
 | `ymin` / `ymax` | auto | y-axis bounds |
 | `zmin` / `zmax` | auto | z-axis bounds (3-D only) |
@@ -159,14 +171,14 @@ Write `\plot` anywhere in your document. When you compile, each command is repla
 | `density` | `20` | arrow grid density for quiver |
 | `style` | `quiver` | `quiver` or `stream` (vector fields only) |
 
-### Available math functions
+### Available math
 
 ```
 sin cos tan sec csc cot  sinh cosh tanh
 arcsin arccos arctan arctan2
 exp log log2 log10 ln sqrt abs sign floor ceil
 pi e inf  real imag re im conj angle arg
-np  (full numpy access, e.g. np.sinc(x))
+np  (full numpy, e.g. np.sinc(x))
 ```
 
 For complex plots, `z` is the complex grid and `i` is the imaginary unit.
