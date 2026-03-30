@@ -2,6 +2,9 @@
 
 A LaTeX editor that runs in two modes from the same file: a **GUI** with a live PDF preview, and a **TUI** that works like Vim. Write your documents, embed `\plot` commands for inline graphs, and compile straight to PDF — no config files, no setup beyond a LaTeX installation.
 
+<img width="1382" height="797" alt="image" src="https://github.com/user-attachments/assets/5fe00966-5f5e-463a-bf50-dad643506a90" />
+
+
 ---
 
 ## Modes
