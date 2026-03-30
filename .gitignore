@@ -30,3 +30,12 @@ dist/
 build/
 *.spec
 editor.exe
+
+# zrktex generated / cache
+_zrkplots/
+
+# IDE / tooling
+.claude/
+
+# Scratch / test files
+tesing.*
